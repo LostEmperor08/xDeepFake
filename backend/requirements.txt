@@ -1,0 +1,19 @@
+# Core FastAPI & ASGI Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+pydantic-settings>=2.4.0
+python-multipart>=0.0.9
+
+# Lightweight Utilities & Scientific Foundations
+numpy>=1.26.0
+pillow>=10.4.0
+
+# Testing & HTTP Client
+httpx>=0.27.0
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+
+# NOTE for Phase 2: Heavyweight forensic and ML libraries
+# (PyMuPDF, opencv-python-headless, librosa, scipy, torch, torchvision)
+# will be integrated in subsequent milestones after foundational validation.

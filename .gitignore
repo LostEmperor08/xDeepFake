@@ -1,0 +1,121 @@
+# ==============================================================================
+# DEEPFAKE X - Comprehensive Project Gitignore
+# ==============================================================================
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE & Editor Files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# Environment Variables & Secrets (CRITICAL: NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.pfx
+
+# Python Virtual Environments & Packages
+backend/.venv/
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python Testing & Type Checking
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# Node & Frontend
+frontend/node_modules/
+node_modules/
+frontend/dist/
+dist/
+frontend/.vite/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+
+# Media, Temporary Files & Uploads (CRITICAL: FORENSIC STORAGE)
+uploads/
+temp/
+tmp/
+*.tmp
+backend/temp/
+backend/uploads/
+backend/app/temp/
+backend/app/uploads/
+*.log
+logs/
+*.sqlite
+*.db
+
+# Machine Learning Checkpoints, Datasets & Large Model Weights
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+*.pb
+*.tflite
+models/checkpoints/
+models/weights/
+weights/
+checkpoints/
+
+# Generated Forensic Reports & Artifacts
+reports/generated/
+exports/
+*.pdf
+!sample_data/*.pdf
+!docs/*.pdf
