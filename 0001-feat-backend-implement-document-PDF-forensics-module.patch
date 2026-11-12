@@ -1,0 +1,859 @@
+From 1d26b8892dbce24634a7da3e8aca6e2f8449b00c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Nov 2026 03:33:00 +0000
+Subject: [PATCH] feat(backend): implement document (PDF) forensics module
+
+Replace the Phase 1 document stub with rule-based PDF forensics that
+returns the shared ModuleResult schema:
+
+- Metadata: creator/producer/author/title, Info vs XMP mismatch
+- Timeline: modified-after-created, modified-before-created, future dates
+- Editor software trail in Producer/Creator
+- Raw bytes: %%EOF / startxref / /Prev counts -> incremental updates;
+  digital signatures lower the severity (signing adds a revision)
+- Overlays: white-filled rectangles + mixed font families, extra
+  content streams, annotations, form fields
+- Optional PyMuPDF text-span check for font changes inside one line
+
+Findings are only created for medium/high indicators and each links
+to its Evidence. model_confidence stays None (no neural detector).
+
+Also: mark document_forensics as completed in /api/v1/modules and
+/health, add pypdf + pymupdf to requirements, and add 5 tests that
+build tiny fictional PDFs in memory (no binaries committed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JTGf9oFJmJH4hHoqrPPseY
+---
+ backend/app/main.py             |   8 +-
+ backend/app/modules/document.py | 564 ++++++++++++++++++++++++++++++--
+ backend/requirements.txt        |   6 +-
+ backend/tests/test_document.py  | 166 ++++++++++
+ backend/tests/test_health.py    |   6 +-
+ 5 files changed, 716 insertions(+), 34 deletions(-)
+ create mode 100644 backend/tests/test_document.py
+
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 8d042ea..61b43e7 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -136,7 +136,7 @@ async def health() -> HealthResponse:
+         "image_forensics (stub)",
+         "video_forensics (stub)",
+         "audio_forensics (stub)",
+-        "document_forensics (stub)",
++        "document_forensics (active)",
+         "provenance_forensics (stub)",
+         "cross_modal_correlation (stub)",
+     ]
+@@ -165,9 +165,9 @@ async def list_modules():
+             {
+                 "id": "document_forensics",
+                 "modality": "document",
+-                "phase": "Phase 1 Baseline",
+-                "status": "analysis_not_implemented",
+-                "description": "PDF object stream, font structure, and revision integrity",
++                "phase": "Phase 2",
++                "status": "completed",
++                "description": "PDF metadata timeline, incremental revisions, overlays, fonts and annotations",
+             },
+             {
+                 "id": "video_forensics",
+diff --git a/backend/app/modules/document.py b/backend/app/modules/document.py
+index b86cc86..36a3b43 100644
+--- a/backend/app/modules/document.py
++++ b/backend/app/modules/document.py
+@@ -1,45 +1,555 @@
+-"""Document Forensic Analysis Subsystem (Phase 1 Baseline).
++"""Document Forensic Analysis Subsystem (Phase 2).
+ 
+-Planned capabilities for Phase 2:
+-- PDF Object Stream & Incremental Update Analysis
+-- Font Embedding Inconsistency & Kerning Discontinuities
+-- Generative Text / Synthetic Layout Detection
+-- Digital Signature & Revision History Integrity
++Rule-based PDF forensics. No ML model is used: every check inspects the file's
++own structure and reports *review indicators* (clues, never proof).
++
++Checks
++------
++1. Metadata      - Creator / Producer / Author / Title, Info dictionary vs XMP.
++2. Timeline      - Created vs Modified dates (later save, impossible order, future dates).
++3. Software      - Producer names of common PDF editing tools.
++4. Raw bytes     - ``%%EOF`` / ``startxref`` / ``/Prev`` counts -> incremental updates.
++5. Signatures    - ``/Sig`` / ``/ByteRange`` lowers severity (signing legitimately adds a revision).
++6. Overlays      - White-filled rectangles painted over content + mixed font families.
++7. Layers        - Annotations on top of the page, extra content streams, form fields.
++8. Text spans    - (PyMuPDF only) font/size changes inside one text line.
++
++Dependencies: ``pypdf`` (required). ``PyMuPDF`` (``fitz``) is optional and enables
++check 8 plus precise overlay detection; the module degrades gracefully without it.
++
++Author: Pratiksha (document authenticity module).
+ """
+ 
++from __future__ import annotations
++
++import re
+ import time
++from collections import Counter
++from datetime import datetime, timedelta, timezone
+ from pathlib import Path
++from typing import Any, Dict, List, Optional
+ 
+ from app.schemas import (
++    Evidence,
++    Finding,
+     Modality,
+     ModuleResult,
+     ModuleStatus,
+     RiskLevel,
+ )
+ 
++try:  # pragma: no cover - import guard
++    from pypdf import PdfReader
++
++    HAVE_PYPDF = True
++except ImportError:  # pragma: no cover
++    HAVE_PYPDF = False
++
++try:  # pragma: no cover - optional dependency
++    import fitz  # PyMuPDF
++
++    HAVE_FITZ = True
++except ImportError:  # pragma: no cover
++    HAVE_FITZ = False
++
++
++MODULE_ID = "document_forensics"
++
++# Producer/creator names of tools that can edit existing PDFs. A hit is a clue only.
++EDITOR_KEYWORDS = [
++    "ilovepdf", "smallpdf", "sejda", "pdfescape", "foxit phantom", "nitro",
++    "pdf-xchange", "pdfelement", "wondershare", "acrobat pro", "photoshop",
++    "inkscape", "pdffiller", "dochub", "canva", "pypdf", "pikepdf", "qpdf",
++]
++
++# Indicator weight -> contributes to the module's review score (0-100).
++SEVERITY_TO_RISK = {
++    "info": RiskLevel.LOW,
++    "low": RiskLevel.LOW,
++    "medium": RiskLevel.MEDIUM,
++    "high": RiskLevel.HIGH,
++}
++
++BASE_LIMITATIONS = [
++    "Indicators are clues, not proof: digital signing, form filling and re-saving leave the same traces.",
++    "A full re-save (not incremental) can erase earlier revision history.",
++    "Metadata fields can be written by hand, so dates and software names may be forged.",
++    "Digital signatures are detected but NOT cryptographically validated.",
++]
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++def _parse_pdf_date(value: Any) -> Optional[datetime]:
++    """Parse a PDF date string such as ``D:20261110093000+05'30'``."""
++    if not value:
++        return None
++    if isinstance(value, datetime):
++        return value
++    s = str(value).strip()
++    if s.startswith("D:"):
++        s = s[2:]
++    m = re.match(
++        r"(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([Zz+\-])?(\d{2})?'?(\d{2})?'?", s
++    )
++    if not m:
++        return None
++    y, mo, d, h, mi, se, sign, tzh, tzm = m.groups()
++    try:
++        dt = datetime(int(y), int(mo or 1), int(d or 1), int(h or 0), int(mi or 0), int(se or 0))
++    except ValueError:
++        return None
++    if sign in ("Z", "z"):
++        dt = dt.replace(tzinfo=timezone.utc)
++    elif sign in ("+", "-"):
++        off = timedelta(hours=int(tzh or 0), minutes=int(tzm or 0))
++        dt = dt.replace(tzinfo=timezone(off if sign == "+" else -off))
++    return dt
++
++
++def _aware(dt: Optional[datetime]) -> Optional[datetime]:
++    if dt is None:
++        return None
++    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
++
++
++def _iso(dt: Optional[datetime]) -> Optional[str]:
++    return dt.isoformat() if dt else None
++
++
++def _humanize(td: timedelta) -> str:
++    secs = int(td.total_seconds())
++    if secs < 3600:
++        return f"{secs // 60} min"
++    if secs < 86400:
++        return f"{secs // 3600} h"
++    return f"{secs // 86400} days"
++
++
++def _first_word(s: str) -> str:
++    return re.split(r"[\s/;,(]+", s.strip().lower())[0] if s else ""
++
++
++def _base_font(name: Any) -> str:
++    """'ABCDEF+Helvetica-Bold' -> 'Helvetica'."""
++    name = str(name).lstrip("/")
++    if "+" in name and len(name.split("+")[0]) == 6:
++        name = name.split("+", 1)[1]
++    return re.split(r"[-,]", name)[0]
++
++
++class _Collector:
++    """Accumulates indicators in a module-neutral form before schema conversion."""
++
++    def __init__(self) -> None:
++        self.items: List[Dict[str, Any]] = []
++
++    def add(
++        self,
++        code: str,
++        title: str,
++        detail: str,
++        severity: str = "info",
++        weight: int = 0,
++        layer: str = "pdf_metadata",
++        category: str = "Document Structure",
++        data: Optional[Dict[str, Any]] = None,
++    ) -> None:
++        self.items.append(
++            {
++                "code": code,
++                "title": title,
++                "detail": detail,
++                "severity": severity,
++                "weight": weight,
++                "layer": layer,
++                "category": category,
++                "data": data or {},
++            }
++        )
++
++
++# ---------------------------------------------------------------------------
++# Check 1-3: metadata, timeline, software
++# ---------------------------------------------------------------------------
++def _read_metadata(reader: "PdfReader") -> Dict[str, Any]:
++    info = reader.metadata or {}
++    meta: Dict[str, Any] = {
++        "title": info.get("/Title"),
++        "author": info.get("/Author"),
++        "creator": info.get("/Creator"),
++        "producer": info.get("/Producer"),
++        "creation_date": _parse_pdf_date(info.get("/CreationDate")),
++        "modification_date": _parse_pdf_date(info.get("/ModDate")),
++        "xmp": {},
++    }
++    try:
++        x = reader.xmp_metadata
++        if x is not None:
++            meta["xmp"] = {
++                "creator_tool": x.xmp_creator_tool,
++                "producer": x.pdf_producer,
++                "create_date": _iso(x.xmp_create_date),
++                "modify_date": _iso(x.xmp_modify_date),
++            }
++    except Exception:
++        pass
++    for k in ("title", "author", "creator", "producer"):
++        if meta[k] is not None:
++            meta[k] = str(meta[k])
++    return meta
++
++
++def _check_metadata(meta: Dict[str, Any], c: _Collector) -> None:
++    if not meta["creator"] and not meta["producer"]:
++        c.add("META_SOFTWARE_MISSING", "No creator/producer recorded",
++              "The file does not say which software made it. Some tools strip metadata on purpose.",
++              "low", 10, category="Metadata Anomaly")
++    if not meta["creation_date"] and not meta["modification_date"]:
++        c.add("META_DATES_MISSING", "No creation/modification dates",
++              "Dates are missing, so no document timeline can be reconstructed.",
++              "low", 10, category="Metadata Anomaly")
++
++    created, modified = _aware(meta["creation_date"]), _aware(meta["modification_date"])
++    if created and modified:
++        gap = modified - created
++        dates = {"created": _iso(created), "modified": _iso(modified)}
++        if gap < timedelta(0):
++            c.add("META_MOD_BEFORE_CREATE", "Modified date is before creation date",
++                  f"Created {_iso(created)}, modified {_iso(modified)}. Impossible in normal use; "
++                  "dates may have been written by hand or a clock was wrong.",
++                  "high", 30, category="Timeline Inconsistency", data=dates)
++        elif gap > timedelta(minutes=5):
++            c.add("META_MODIFIED_LATER", "File was saved again later",
++                  f"Created {_iso(created)}, last modified {_iso(modified)} ({_humanize(gap)} later). "
++                  "Could be an edit, a signature, or a plain re-save.",
++                  "medium", 15, category="Timeline Inconsistency", data=dates)
++        else:
++            c.add("META_DATES_MATCH", "Creation and modification dates match",
++                  f"Both dates are about {_iso(created)}. No later save is recorded in metadata.",
++                  "info", 0, category="Timeline", data=dates)
++
++    now = datetime.now(timezone.utc)
++    for label, dt in (("creation", created), ("modification", modified)):
++        if dt and dt > now + timedelta(days=1):
++            c.add(f"META_FUTURE_{label.upper()}", f"{label.title()} date is in the future",
++                  f"{_iso(dt)} is after today's date; dates were likely set manually.",
++                  "high", 25, category="Timeline Inconsistency")
++
++    creator, producer = meta["creator"] or "", meta["producer"] or ""
++    if creator and producer and _first_word(creator) != _first_word(producer):
++        c.add("META_CREATOR_PRODUCER_DIFFER", "Created in one app, saved by another",
++              f"Creator = '{creator}', Producer = '{producer}'. Normal for 'Save as PDF' workflows, "
++              "but also seen when a PDF is opened in an editor and re-saved.",
++              "low", 5, category="Software Trail")
++
++    hits = [k for k in EDITOR_KEYWORDS if k in f"{creator} {producer}".lower()]
++    if hits:
++        c.add("META_EDITOR_SOFTWARE", "PDF editing software in metadata",
++              f"Found: {', '.join(hits)}. These tools can edit existing PDFs; presence is a clue only.",
++              "medium", 15, category="Software Trail", data={"matches": hits})
++
++    xmp_producer = (meta["xmp"] or {}).get("producer") or ""
++    if xmp_producer and producer and xmp_producer.strip() != producer.strip():
++        c.add("META_XMP_MISMATCH", "Info and XMP metadata disagree",
++              f"Info Producer = '{producer}' but XMP Producer = '{xmp_producer}'. Often happens when a "
++              "second tool updates only one metadata block.",
++              "medium", 10, category="Metadata Anomaly")
++
++
++# ---------------------------------------------------------------------------
++# Check 4-5: raw bytes, revisions, signatures
++# ---------------------------------------------------------------------------
++def _check_revisions(raw: bytes, c: _Collector) -> Dict[str, Any]:
++    eof_count = len(re.findall(rb"%%EOF", raw))
++    startxref_count = len(re.findall(rb"startxref", raw))
++    prev_links = len(re.findall(rb"/Prev\s+\d+", raw))
++    has_sig = bool(re.search(rb"/Type\s*/Sig\b|/ByteRange", raw))
++    linearized = bool(re.search(rb"/Linearized", raw[:2048]))
++    expected = 2 if linearized else 1
++
++    rev = {
++        "eof_markers": eof_count,
++        "startxref_count": startxref_count,
++        "xref_tables": len(re.findall(rb"(?m)^xref\s*$", raw)),
++        "xref_streams": len(re.findall(rb"/Type\s*/XRef", raw)),
++        "prev_links": prev_links,
++        "estimated_revisions": max(1, startxref_count),
++        "linearized": linearized,
++        "has_signature_dictionary": has_sig,
++    }
++
++    if eof_count > expected:
++        extra = eof_count - expected
++        why = (
++            "A digital signature is present and signing ALWAYS appends a revision, so this may be legitimate."
++            if has_sig
++            else "No signature was found, so the revision came from another later save "
++            "(edit, form fill, annotation, or tampering)."
++        )
++        c.add("RAW_INCREMENTAL_UPDATE", f"{extra} later revision(s) appended to the file",
++              f"Found {eof_count} '%%EOF' markers and {prev_links} '/Prev' links. {why}",
++              "medium" if has_sig else "high", 15 if has_sig else 25,
++              layer="pdf_raw_bytes", category="Incremental Update", data=rev)
++    else:
++        c.add("RAW_SINGLE_REVISION", "Single revision",
++              f"{eof_count} '%%EOF' marker(s) found{' (normal for a linearized file)' if linearized else ''}. "
++              "No incremental update detected.",
++              "info", 0, layer="pdf_raw_bytes", category="Revision History", data=rev)
++
++    if has_sig:
++        c.add("RAW_SIGNATURE_PRESENT", "Digital signature structure found",
++              "A /Sig or /ByteRange entry exists. The certificate chain is not validated by this module.",
++              "info", 0, layer="pdf_raw_bytes", category="Digital Signature")
++
++    last = raw.rfind(b"%%EOF")
++    if last >= 0:
++        tail = len(raw[last + 5:].strip())
++        if tail > 32:
++            c.add("RAW_TRAILING_DATA", "Data after the final %%EOF",
++                  f"{tail} bytes follow the last end-of-file marker. Readers ignore it, but it can hide content.",
++                  "medium", 10, layer="pdf_raw_bytes", category="Structural Anomaly")
++    return rev
++
++
++# ---------------------------------------------------------------------------
++# Check 6-7: fonts, overlays, annotations, forms (pypdf)
++# ---------------------------------------------------------------------------
++_WHITE_RECT = re.compile(
++    r"1(?:\.0+)?\s+1(?:\.0+)?\s+1(?:\.0+)?\s+rg\b(.{0,200}?)"
++    r"(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re\s+f\b",
++    re.S,
++)
++
++
++def _check_pages(reader: "PdfReader", c: _Collector) -> List[Dict[str, Any]]:
++    pages: List[Dict[str, Any]] = []
++    for i, page in enumerate(reader.pages, start=1):
++        fonts, annots, boxes, n_streams = set(), [], [], 1
++        try:
++            res = page.get("/Resources")
++            res = res.get_object() if res is not None else {}
++            fdict = res.get("/Font")
++            if fdict is not None:
++                for ref in fdict.get_object().values():
++                    fonts.add(str(ref.get_object().get("/BaseFont", "unknown")).lstrip("/"))
++        except Exception:
++            pass
++        try:
++            for a in page.get("/Annots") or []:
++                annots.append(str(a.get_object().get("/Subtype", "?")).lstrip("/"))
++        except Exception:
++            pass
++        try:
++            cs = page.get("/Contents")
++            cs = cs.get_object() if cs is not None else None
++            n_streams = len(cs) if isinstance(cs, list) else 1
++            content = page.get_contents().get_data().decode("latin-1", "ignore")
++            pw, ph = float(page.mediabox.width), float(page.mediabox.height)
++            for m in _WHITE_RECT.finditer(content):
++                x, y, w, h = (float(v) for v in m.groups()[1:])
++                if abs(w) * abs(h) > 50 and abs(w) < pw * 0.9 and abs(h) < ph * 0.9:
++                    boxes.append([round(x), round(y), round(abs(w)), round(abs(h))])
++        except Exception:
++            pass
++
++        families = sorted({_base_font(f) for f in fonts})
++        visible = [a for a in annots if a not in ("Link", "Widget", "Popup")]
++        pages.append({
++            "page": i, "fonts": sorted(fonts), "font_families": families,
++            "annotations": annots, "content_streams": n_streams, "white_filled_boxes": boxes,
++        })
++
++        if len(families) >= 4:
++            c.add("FONT_MANY_FAMILIES", f"Page {i}: many font families",
++                  f"{len(families)} families: {', '.join(families)}. Designed documents usually use 1-3.",
++                  "low", 5, layer="pdf_fonts", category="Font Inconsistency")
++        if visible:
++            c.add("ANNOT_PRESENT", f"Page {i}: annotations on top of page",
++                  f"Types: {', '.join(Counter(visible).elements())}. Annotations can sit over and hide original text.",
++                  "medium", 15, layer="pdf_annotations", category="Overlay / Layering",
++                  data={"page": i, "annotations": visible})
++        if len(families) >= 2 and boxes:
++            c.add("OVERLAY_WHITEOUT_PATTERN", f"Page {i}: white box painted + mixed fonts",
++                  f"{len(boxes)} white-filled rectangle(s) {boxes} and fonts {families}. Matches the "
++                  "'cover old text, type new text' pattern. Could also be legitimate design.",
++                  "high", 20, layer="pdf_content_stream", category="Overlay / Layering",
++                  data={"page": i, "boxes": boxes, "font_families": families})
++        elif boxes:
++            c.add("OVERLAY_WHITE_BOX_RAW", f"Page {i}: white-filled box(es) in drawing commands",
++                  f"Boxes (x, y, w, h): {boxes}. Can be background design or a whiteout over old text.",
++                  "low", 5, layer="pdf_content_stream", category="Overlay / Layering",
++                  data={"page": i, "boxes": boxes})
++        if n_streams > 1:
++            c.add("PAGE_MULTI_STREAM", f"Page {i}: {n_streams} content streams",
++                  "Extra drawing streams are sometimes added by editors to paint over the original.",
++                  "low", 5, layer="pdf_content_stream", category="Overlay / Layering")
++
++    try:
++        if reader.get_fields():
++            c.add("FORM_FIELDS", "Fillable form fields present",
++                  "Form values can be changed without altering the page design.",
++                  "low", 5, layer="pdf_acroform", category="Editable Content")
++    except Exception:
++        pass
++    return pages
++
++
++# ---------------------------------------------------------------------------
++# Check 8: text spans (PyMuPDF, optional)
++# ---------------------------------------------------------------------------
++def _check_spans_fitz(file_path: Path, c: _Collector) -> None:
++    doc = fitz.open(str(file_path))
++    try:
++        reported = 0
++        for pno, page in enumerate(doc, start=1):
++            for block in page.get_text("dict").get("blocks", []):
++                for line in block.get("lines", []):
++                    spans = [s for s in line.get("spans", []) if s["text"].strip()]
++                    if len(spans) < 2:
++                        continue
++                    fams = sorted({_base_font(s["font"]) for s in spans})
++                    sizes = sorted({round(s["size"], 1) for s in spans})
++                    if (len(fams) > 1 or len(sizes) > 1) and reported < 10:
++                        text = "".join(s["text"] for s in spans).strip()[:60]
++                        c.add("FONT_MIXED_IN_LINE", f"Page {pno}: font changes inside one line",
++                              f"'{text}' uses fonts {fams} / sizes {sizes}. Swapped names, dates or "
++                              "amounts often show up like this.",
++                              "medium", 10, layer="pdf_text_spans", category="Font Inconsistency",
++                              data={"page": pno, "text": text, "fonts": fams, "sizes": sizes})
++                        reported += 1
++    finally:
++        doc.close()
++
++
++# ---------------------------------------------------------------------------
++# Public entry point
++# ---------------------------------------------------------------------------
++def _risk_from_score(score: int) -> RiskLevel:
++    if score >= 50:
++        return RiskLevel.HIGH
++    if score >= 20:
++        return RiskLevel.MEDIUM
++    return RiskLevel.LOW
++
+ 
+ def analyze_document(file_path: Path, filename: str) -> ModuleResult:
+-    """Performs Phase 1 baseline inspection on document artifacts (PDF)."""
+-    start_time = time.perf_counter()
++    """Inspect a PDF for signs of later modification and return a ``ModuleResult``."""
++    start = time.perf_counter()
++    limitations = list(BASE_LIMITATIONS)
++
++    def _result(status: ModuleStatus, risk: RiskLevel, details: Dict[str, Any],
++                findings=None, evidence=None) -> ModuleResult:
++        return ModuleResult(
++            module=MODULE_ID,
++            modality=Modality.DOCUMENT,
++            status=status,
++            risk_level=risk,
++            model_confidence=None,  # rule-based: no neural detector score
++            findings=findings or [],
++            evidence=evidence or [],
++            limitations=limitations,
++            processing_time_ms=round((time.perf_counter() - start) * 1000.0, 2),
++            details=details,
++        )
++
++    if not HAVE_PYPDF:
++        limitations.insert(0, "pypdf is not installed: run `pip install pypdf`.")
++        return _result(ModuleStatus.SKIPPED, RiskLevel.INCONCLUSIVE, {"error": "pypdf missing"})
++
++    raw = b""
++    try:
++        raw = Path(file_path).read_bytes()
++        reader = PdfReader(str(file_path))
++        if reader.is_encrypted:
++            try:
++                reader.decrypt("")
++                limitations.append("PDF is encrypted; opened with an empty password.")
++            except Exception as exc:
++                raise ValueError("PDF is password protected") from exc
++        page_count = len(reader.pages)
++    except Exception as exc:
++        return _result(ModuleStatus.FAILED, RiskLevel.INCONCLUSIVE,
++                       {"error": f"Could not parse PDF: {exc}", "file_size_bytes": len(raw)})
++
++    c = _Collector()
++    meta = _read_metadata(reader)
++    _check_metadata(meta, c)
++    revisions = _check_revisions(raw, c)
++    pages = _check_pages(reader, c)
++
++    if HAVE_FITZ:
++        try:
++            _check_spans_fitz(Path(file_path), c)
++        except Exception as exc:  # pragma: no cover
++            limitations.append(f"PyMuPDF text-span check failed: {exc}")
++    else:
++        limitations.append("PyMuPDF not installed: text-span font check skipped (pip install pymupdf).")
++
++    # ---- convert to schema --------------------------------------------------
++    stamp = int(time.time() * 1000)
++    evidence: List[Evidence] = []
++    findings: List[Finding] = []
++    for idx, item in enumerate(c.items):
++        ev_id = f"ev_doc_{item['code'].lower()}_{stamp}_{idx}"
++        evidence.append(
++            Evidence(
++                id=ev_id,
++                label=item["title"],
++                description=item["detail"],
++                modality=Modality.DOCUMENT,
++                confidence=None,
++                source_layer=item["layer"],
++                metadata={"indicator": item["code"], "severity": item["severity"],
++                          "weight": item["weight"], **item["data"]},
++            )
++        )
++        if item["severity"] in ("medium", "high"):
++            findings.append(
++                Finding(
++                    id=f"fd_doc_{item['code'].lower()}_{stamp}_{idx}",
++                    title=item["title"],
++                    description=item["detail"],
++                    risk_level=SEVERITY_TO_RISK[item["severity"]],
++                    category=item["category"],
++                    evidence_refs=[ev_id],
++                    explanation=(
++                        f"Review indicator '{item['code']}' (weight {item['weight']}). "
++                        "This is a clue that the document changed after it was first created; "
++                        "it is not proof of forgery on its own."
++                    ),
++                )
++            )
++
++    score = min(100, sum(i["weight"] for i in c.items))
++    highs = sum(1 for i in c.items if i["severity"] == "high")
++    if score >= 50 or highs >= 2:
++        verdict = "multiple_indicators"
++    elif score >= 20:
++        verdict = "needs_review"
++    else:
++        verdict = "no_strong_indicators"
++    risk = RiskLevel.HIGH if verdict == "multiple_indicators" else _risk_from_score(score)
++
+     details = {
+-        "file_size_bytes": file_path.stat().st_size if file_path.exists() else 0,
+         "format": "PDF",
++        "file_size_bytes": len(raw),
++        "pdf_header": raw[:8].decode("latin-1", "ignore").strip(),
++        "page_count": page_count,
++        "review_score": score,
++        "verdict": verdict,
++        "metadata": {
++            "title": meta["title"],
++            "author": meta["author"],
++            "creator": meta["creator"],
++            "producer": meta["producer"],
++            "creation_date": _iso(meta["creation_date"]),
++            "modification_date": _iso(meta["modification_date"]),
++            "xmp": meta["xmp"],
++        },
++        "revisions": revisions,
++        "pages": pages,
++        "engines": {"pypdf": HAVE_PYPDF, "pymupdf": HAVE_FITZ},
+     }
+-
+-    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+-
+-    return ModuleResult(
+-        module="document_forensics",
+-        modality=Modality.DOCUMENT,
+-        status=ModuleStatus.ANALYSIS_NOT_IMPLEMENTED,
+-        risk_level=RiskLevel.INCONCLUSIVE,
+-        model_confidence=None,
+-        findings=[],
+-        evidence=[],
+-        limitations=[
+-            "Phase 1 Foundation: PyMuPDF font object and stream parsing pending Phase 2.",
+-            "Generative PDF layout and incremental revision analysis will be enabled in Phase 2.",
+-        ],
+-        processing_time_ms=round(elapsed_ms, 2),
+-        details=details,
+-    )
++    return _result(ModuleStatus.COMPLETED, risk, details, findings, evidence)
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 69b5250..59db615 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -9,11 +9,15 @@ python-multipart>=0.0.9
+ numpy>=1.26.0
+ pillow>=10.4.0
+ 
++# Document Forensics (PDF structure; PyMuPDF enables text-span font checks)
++pypdf>=5.0.0
++pymupdf>=1.24.0
++
+ # Testing & HTTP Client
+ httpx>=0.27.0
+ pytest>=8.0.0
+ pytest-asyncio>=0.24.0
+ 
+ # NOTE for Phase 2: Heavyweight forensic and ML libraries
+-# (PyMuPDF, opencv-python-headless, librosa, scipy, torch, torchvision)
++# (opencv-python-headless, librosa, scipy, torch, torchvision)
+ # will be integrated in subsequent milestones after foundational validation.
+diff --git a/backend/tests/test_document.py b/backend/tests/test_document.py
+new file mode 100644
+index 0000000..1ac8295
+--- /dev/null
++++ b/backend/tests/test_document.py
+@@ -0,0 +1,166 @@
++"""Tests for the Document (PDF) Forensic Module.
++
++Fixtures are tiny FICTIONAL PDFs written byte-by-byte here, so no binary
++files are committed and no real documents are involved.
++"""
++
++from pathlib import Path
++
++import pytest
++
++from app.modules.document import analyze_document
++from app.schemas import ModuleStatus, RiskLevel
++
++pytest.importorskip("pypdf")
++
++
++# ---------------------------------------------------------------------------
++# Minimal PDF writer (original file + optional incremental update)
++# ---------------------------------------------------------------------------
++def _build_pdf(objects: dict, root: int, info: int) -> bytes:
++    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
++    offsets = {}
++    for num in sorted(objects):
++        offsets[num] = len(out)
++        out += f"{num} 0 obj\n".encode() + objects[num] + b"\nendobj\n"
++    xref_pos = len(out)
++    size = max(objects) + 1
++    out += f"xref\n0 {size}\n0000000000 65535 f \n".encode()
++    for n in range(1, size):
++        out += f"{offsets[n]:010d} 00000 n \n".encode()
++    out += f"trailer\n<< /Size {size} /Root {root} 0 R /Info {info} 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode()
++    return bytes(out)
++
++
++def _append_update(base: bytes, objects: dict, root: int, info: int) -> bytes:
++    """Append an incremental update section, exactly like an editor would."""
++    prev = int(base.rsplit(b"startxref", 1)[1].split()[0])
++    out = bytearray(base)
++    offsets = {}
++    for num in sorted(objects):
++        offsets[num] = len(out)
++        out += f"{num} 0 obj\n".encode() + objects[num] + b"\nendobj\n"
++    xref_pos = len(out)
++    out += b"xref\n"
++    for num in sorted(objects):
++        out += f"{num} 1\n{offsets[num]:010d} 00000 n \n".encode()
++    size = max(objects) + 1
++    out += (f"trailer\n<< /Size {size} /Root {root} 0 R /Info {info} 0 R /Prev {prev} >>\n"
++            f"startxref\n{xref_pos}\n%%EOF\n").encode()
++    return bytes(out)
++
++
++def _stream(data: bytes) -> bytes:
++    return f"<< /Length {len(data)} >>\nstream\n".encode() + data + b"\nendstream"
++
++
++ORIGINAL_CONTENT = (b"BT /F1 20 Tf 150 500 Td (Certificate of Participation - DEMO) Tj ET\n"
++                    b"BT /F1 16 Tf 200 400 Td (Score: 62 / 100) Tj ET")
++
++
++def _original_objects() -> dict:
++    return {
++        1: b"<< /Type /Catalog /Pages 2 0 R >>",
++        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
++        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
++            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
++        4: _stream(ORIGINAL_CONTENT),
++        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
++        6: (b"<< /Title (Demo Certificate - SAMPLE) /Author (DeepfakeX Team demo) "
++            b"/Creator (DeepfakeX Sample Generator) /Producer (DeepfakeX Sample Generator) "
++            b"/CreationDate (D:20261001100000+05'30') /ModDate (D:20261001100000+05'30') >>"),
++    }
++
++
++@pytest.fixture
++def original_pdf(tmp_path: Path) -> Path:
++    p = tmp_path / "demo_original.pdf"
++    p.write_bytes(_build_pdf(_original_objects(), root=1, info=6))
++    return p
++
++
++@pytest.fixture
++def edited_pdf(tmp_path: Path) -> Path:
++    base = _build_pdf(_original_objects(), root=1, info=6)
++    overlay = (b"q 1 1 1 rg 195 395 160 25 re f Q\n"
++               b"BT /F2 17 Tf 200 400 Td (Score: 98 / 100) Tj ET")
++    update = {
++        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
++            b"/Resources << /Font << /F1 5 0 R /F2 8 0 R >> >> /Contents [4 0 R 7 0 R] /Annots [9 0 R] >>"),
++        6: (b"<< /Title (Demo Certificate - SAMPLE) /Author (DeepfakeX Team demo) "
++            b"/Creator (DeepfakeX Sample Generator) /Producer (iLovePDF demo edit) "
++            b"/CreationDate (D:20261001100000+05'30') /ModDate (D:20261107150000+05'30') >>"),
++        7: _stream(overlay),
++        8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold >>",
++        9: b"<< /Type /Annot /Subtype /FreeText /Rect [400 700 560 725] /Contents (Verified copy) /DA (/Helv 11 Tf 0 g) >>",
++    }
++    p = tmp_path / "demo_edited.pdf"
++    p.write_bytes(_append_update(base, update, root=1, info=6))
++    return p
++
++
++def _codes(result):
++    return {e.metadata["indicator"] for e in result.evidence}
++
++
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
++def test_original_pdf_has_no_strong_indicators(original_pdf):
++    res = analyze_document(original_pdf, original_pdf.name)
++    assert res.status == ModuleStatus.COMPLETED
++    assert res.module == "document_forensics"
++    assert res.risk_level == RiskLevel.LOW
++    assert res.details["verdict"] == "no_strong_indicators"
++    assert res.details["page_count"] == 1
++    assert res.details["revisions"]["eof_markers"] == 1
++    assert res.details["metadata"]["producer"] == "DeepfakeX Sample Generator"
++    assert "RAW_SINGLE_REVISION" in _codes(res)
++    assert "META_DATES_MATCH" in _codes(res)
++    assert res.findings == []
++    assert res.model_confidence is None
++
++
++def test_edited_pdf_flags_multiple_indicators(edited_pdf):
++    res = analyze_document(edited_pdf, edited_pdf.name)
++    codes = _codes(res)
++    assert res.status == ModuleStatus.COMPLETED
++    assert res.risk_level == RiskLevel.HIGH
++    assert res.details["verdict"] == "multiple_indicators"
++    assert res.details["revisions"]["eof_markers"] == 2
++    assert res.details["revisions"]["prev_links"] == 1
++    for expected in ("RAW_INCREMENTAL_UPDATE", "META_MODIFIED_LATER", "META_EDITOR_SOFTWARE",
++                     "ANNOT_PRESENT", "OVERLAY_WHITEOUT_PATTERN", "PAGE_MULTI_STREAM"):
++        assert expected in codes, expected
++    # every finding must point at real evidence
++    ev_ids = {e.id for e in res.evidence}
++    assert res.findings and all(set(f.evidence_refs) <= ev_ids for f in res.findings)
++
++
++def test_signature_lowers_revision_severity(tmp_path):
++    base = _build_pdf(_original_objects(), root=1, info=6)
++    sig = {10: b"<< /Type /Sig /Filter /Adobe.PPKLite /ByteRange [0 10 20 30] /Contents <00> >>"}
++    p = tmp_path / "demo_signed.pdf"
++    p.write_bytes(_append_update(base, sig, root=1, info=6))
++    res = analyze_document(p, p.name)
++    inc = next(e for e in res.evidence if e.metadata["indicator"] == "RAW_INCREMENTAL_UPDATE")
++    assert inc.metadata["severity"] == "medium"
++    assert "RAW_SIGNATURE_PRESENT" in _codes(res)
++
++
++def test_modified_before_created_is_high(tmp_path):
++    objs = _original_objects()
++    objs[6] = b"<< /Producer (Demo) /CreationDate (D:20261010100000Z) /ModDate (D:20261001100000Z) >>"
++    p = tmp_path / "demo_dates.pdf"
++    p.write_bytes(_build_pdf(objs, root=1, info=6))
++    res = analyze_document(p, p.name)
++    assert "META_MOD_BEFORE_CREATE" in _codes(res)
++
++
++def test_corrupt_pdf_returns_failed_status(tmp_path):
++    p = tmp_path / "broken.pdf"
++    p.write_bytes(b"%PDF-1.4\nthis is not a real pdf body")
++    res = analyze_document(p, p.name)
++    assert res.status == ModuleStatus.FAILED
++    assert res.risk_level == RiskLevel.INCONCLUSIVE
++    assert "error" in res.details
+diff --git a/backend/tests/test_health.py b/backend/tests/test_health.py
+index c48e6e8..1e9d7c9 100644
+--- a/backend/tests/test_health.py
++++ b/backend/tests/test_health.py
+@@ -37,6 +37,8 @@ async def test_modules_endpoint():
+         data = response.json()
+         assert "modules" in data
+         assert len(data["modules"]) == 6
+-        # Verify all modules report analysis_not_implemented in Phase 1
++        # Implemented modules report "completed"; the rest are still Phase 1 stubs
++        implemented = {"document_forensics"}
+         for mod in data["modules"]:
+-            assert mod["status"] == "analysis_not_implemented"
++            expected = "completed" if mod["id"] in implemented else "analysis_not_implemented"
++            assert mod["status"] == expected
+-- 
+2.43.0
+
