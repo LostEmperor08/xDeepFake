@@ -1,15 +1,39 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DEEPFAKE X — Multimodal Forensic Verification</title>
-    <meta name="description" content="Explainable multimodal synthetic media forensics and authenticity verification platform for images, video, audio, and documents." />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <title>DEEPFAKE X — Multimodal Forensics & Authenticity Verification</title>
+    <meta name="description" content="One platform. Four media types. Multiple forensic signals. One explainable investigation report." />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>" />
+    <!-- Tailwind CSS CDN for instant, zero-configuration rendering -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            colors: {
+              forensic: {
+                bg: '#090a0f',
+                card: '#11131a',
+                border: '#232736',
+                accent: '#3b82f6',
+                danger: '#ef4444',
+                warning: '#f59e0b',
+                success: '#10b981'
+              }
+            },
+            fontFamily: {
+              mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', 'monospace'],
+              sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif']
+            }
+          }
+        }
+      }
+    </script>
   </head>
-  <body class="bg-[#0b0f19] text-slate-100">
+  <body class="bg-[#090a0f] text-zinc-100 min-h-screen antialiased selection:bg-blue-600 selection:text-white font-sans">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
